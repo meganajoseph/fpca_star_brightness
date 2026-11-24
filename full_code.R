@@ -6,63 +6,79 @@ library(dplyr)
 library(face)
 py_install("lightkurve")
 lk <- import("lightkurve")
+gc_py <- import("gc")
 
 mcquillan <- read.csv("data/Table_1_Periodic.txt")
 
-g_stars <- subset(mcquillan, Teff >= 5200 & Teff <= 6000)
-set.seed(1)
-sample_ids <- sample(g_stars$KID, 100)
-targets <- paste("KIC", sample_ids)
+g_stars <- mcquillan %>% filter(Teff >= 5300 & Teff <= 6000 & !is.na(Prot))
 
-get_lc <- function(target, outdir = "data/lightcurves", quarter = NULL) {
-  dir.create(outdir, showWarnings = FALSE)
+get_lc <- function(target, outdir = "data/lightcurves_fold",
+                   window = 90, thin = 10, min_obs = 300) {
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
   file <- file.path(outdir, paste0(gsub(" ", "_", target), ".csv"))
+  skip <- paste0(file, ".skip")
   if (file.exists(file)) return(read.csv(file))
+  if (file.exists(skip)) return(NULL)   # already known to fail
   
   sr <- lk$search_lightcurve(target, mission = "Kepler", author = "Kepler",
-                             exptime = 1800L, quarter = quarter)
-  if (py_len(sr) == 0) return(NULL)
+                             exptime = 1800L)
+  if (py_len(sr) == 0) { file.create(skip); return(NULL) }
   
   lc <- sr$download_all()$stitch()$remove_nans()
-  df <- lc$to_pandas()
-  df$time <- as.numeric(rownames(df))
-  rownames(df) <- NULL
-  df <- data.frame(target = target, df[, c("time", "flux", "flux_err", "quality")])
+  pdf <- lc$to_pandas()
+  df <- data.frame(target = target,
+                   time = as.numeric(rownames(pdf)),
+                   flux = pdf$flux, flux_err = pdf$flux_err,
+                   quality = pdf$quality)
+  rm(lc, pdf); gc_py$collect()                    # free the Python memory
   
+  df <- df[df$quality == 0, ]
+  df <- df[order(df$time), ]
+  
+  # find the minimum at full resolution, before thinning
+  df$flux_smooth <- runmed(df$flux, k = 25)
+  t_min <- df$time[which.min(df$flux_smooth)]
+  
+  df <- df[df$time >= t_min & df$time < t_min + window, ]
+  df$t0 <- df$time - t_min
+  df <- df[seq(1, nrow(df), by = thin), ]          # every 10th observation
+  
+  if (nrow(df) < min_obs) { file.create(skip); return(NULL) }
+  
+  df$rel_flux <- df$flux / median(df$flux) - 1
   write.csv(df, file, row.names = FALSE)
   df
 }
 
+set.seed(1)
+candidates <- sample(g_stars$KID)    # shuffled list of all G stars
+n_target <- 100
+results <- list()
+
 # 3. Download in a loop, run once
-all_lc <- vector("list", length(targets))
-for (i in seq_along(targets)) {
-  message(i, "/", length(targets), ": ", targets[i])
-  all_lc[[i]] <- tryCatch(get_lc(targets[i]),
-                          error = function(e) { message("  failed"); NULL })
+for (kid in candidates) {
+  if (length(results) >= n_target) break
+  t <- paste("KIC", kid)
+  message(length(results), " collected; trying ", t)
+  res <- tryCatch(get_lc(t), error = function(e) { message("  failed"); NULL })
+  if (!is.null(res)) results[[t]] <- res
 }
 
-# 4. Combine into one data frame
-files <- list.files("data/lightcurves", pattern = "\\.csv$", full.names = TRUE)
-df_all <- do.call(rbind, lapply(files, read.csv))
-df_all <- subset(df_all, quality == 0)
-df_all$KID <- as.integer(sub("KIC ", "", df_all$target))
-df_all <- merge(df_all,
-                mcquillan[, c("KID", "Prot", "Prot_err")],
-                by = "KID")
+# Combine and add phase
+df_fold <- bind_rows(results) %>%
+  mutate(KID = as.integer(sub("KIC ", "", target))) %>%
+  left_join(mcquillan %>% select(KID, Prot, Prot_err), by = "KID") %>%
+  mutate(phase = (t0 %% Prot) / Prot)
 
-df_fold <- df_all |>
-  group_by(KID) |>
-  arrange(time, .by_group = TRUE) |>
-  mutate(
-    flux_smooth = runmed(flux, k = 25),       # ~12 hours, reduces noise
-    t_min = time[which.min(flux_smooth)]          # time of the minimum
-  ) |>
-  filter(time >= t_min, time < t_min + 90) |>     # 90-day window
-  mutate(
-    t0    = time - t_min,                         # minimum now at t0 = 0
-    phase = (t0 %% Prot) / Prot
-  ) |>
-  ungroup()
+df_fold %>% count(KID) %>% summarise(min(n), max(n), stars = n())
+
+# 4. Combine into one data frame
+files <- list.files("data/lightcurves_fold", pattern = "\\.csv$", full.names = TRUE)
+
+df_fold <- map_dfr(files, read.csv) %>%
+  mutate(KID = as.integer(sub("KIC ", "", target))) %>%
+  left_join(mcquillan %>% select(KID, Prot, Prot_err), by = "KID") %>%
+  mutate(phase = (t0 %% Prot) / Prot)
 
 ggplot(df_fold, aes(phase, flux, group=KID, color=KID)) + geom_point(size = 0.1, alpha = 0.3)
 
