@@ -4,6 +4,7 @@ library(refund)
 library(tidyverse)
 library(dplyr)
 library(face)
+library(fields)
 py_install("lightkurve")
 lk <- import("lightkurve")
 gc_py <- import("gc")
@@ -82,7 +83,34 @@ df_fold <- map_dfr(files, read.csv) %>%
 
 ggplot(df_fold, aes(phase, flux, group=KID, color=KID)) + geom_point(size = 0.1, alpha = 0.3)
 
+# FPCA
 ydata <- df_fold %>% 
   select(c(KID, phase, flux)) %>% 
   rename(subj=KID, argvals=phase, y=flux)
-fit_smoothed <- face.sparse(ydata, pve = 0.95)
+fit_smoothed_001 <- face.sparse(ydata, pve = 0.95, lambda=0.01)
+fit_smoothed_1 <- face.sparse(ydata, pve = 0.95, lambda=1)
+fit_smoothed_1000 <- face.sparse(ydata, pve = 0.95, lambda=1000)
+fit_smoothed_100 <- face.sparse(ydata, pve = 0.95, lambda=100)
+
+# data vis
+image(seq(min(ydata$argvals), max(ydata$argvals), length.out=100), seq(min(ydata$argvals), max(ydata$argvals), length.out=100), fit_smoothed$Chat.new)
+
+png("images/smoothed_covariances.png", width = 10, height = 8, units = "in", res = 300)
+par(mfrow = c(2, 2), oma = c(2, 2, 0, 0))
+image.plot(fit_smoothed_001$Chat.new, zlim = c(-4e-5, 5e-5), 
+           main = bquote(bold("Smoothed (" ~ tau ~ "= 0.01)" )), legend.mar = 10)
+
+image.plot(fit_smoothed_1$Chat.new, zlim = c(-4e-5, 5e-5),
+           main = bquote(bold("Smoothed (" ~ tau ~ "= 1)" )), legend.mar = 10)
+
+image.plot(fit_smoothed_100$Chat.new, zlim = c(-4e-5, 5e-5),
+           main = bquote(bold("Smoothed (" ~ tau ~ "= 100)" )), legend.mar = 10)
+
+image.plot(fit_smoothed_1000$Chat.new, zlim = c(-4e-5, 5e-5),
+           main = bquote(bold("Smoothed (" ~ tau ~ "= 1000)" )), legend.mar = 1)
+
+mtext("Phase of Period", side = 1, line = -1, outer = TRUE)
+mtext("Phase of Period", side = 2, line = -1, outer = TRUE)
+dev.off()
+
+image.plot(fit_smoothed$Chat.new)
